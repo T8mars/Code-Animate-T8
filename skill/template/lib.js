@@ -118,3 +118,121 @@ function stamp(ctx, label, sub, x, y, a, rot = -0.08) {
   if (sub) { ctx.font = `500 32px ${FONT.sans}`; const sw = ctx.measureText(sub).width + 28; ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(-sw / 2, 60, sw, 44); txt(ctx, sub, 0, 93, { size: 32, color: 'rgba(245,240,230,0.95)', align: 'center', font: FONT.sans }); }
   ctx.restore();
 }
+
+// ---- 运动节奏工具（成片里踩过的坑：诡盘每秒跳 8 下，30fps 下变成 4/4/4/3 帧交替，看起来一卡一卡） ----
+// stepAt(t, fps, stepsPerSec)：离散步进动画（定格、诡盘、手翻书、像素角色）的「第几格」。
+//   - 每秒步数必须是 fps 的整数约数（30fps → 30/15/10/6/5/3/2/1），这样每一格停留的帧数完全相同，节奏才均匀。
+//   - 不是约数时就近取一个约数并 console.warn 一次（例：8 → 10，即每格 3 帧）。
+//   - 用帧号做整数运算，不受 t 的浮点误差影响（0.1+0.2 这类误差会让某一格提前/推迟一帧）。
+//   返回整数格号（从 0 开始，t<0 时为负数）。典型用法：ang = stepAt(lt, FPS, 30) * Math.PI / 6（每帧转一格）。
+const _stepWarned = {};
+function stepAt(t, fps = FPS, stepsPerSec = fps) {
+  const divs = []; for (let d = 1; d <= fps; d++) if (fps % d === 0) divs.push(d);
+  let sps = stepsPerSec;
+  if (!divs.includes(sps)) {
+    sps = divs.reduce((best, d) => Math.abs(d - stepsPerSec) <= Math.abs(best - stepsPerSec) ? d : best, divs[0]); // 距离相同取较大的（更顺）
+    const key = fps + ':' + stepsPerSec;
+    if (!_stepWarned[key]) { _stepWarned[key] = 1; console.warn(`stepAt: 每秒 ${stepsPerSec} 步不是 ${fps}fps 的整数约数，节奏会不均匀；已改为每秒 ${sps} 步（每格 ${fps / sps} 帧）`); }
+  }
+  const f = Math.round(t * fps);                 // 当前帧号（整数）
+  return Math.floor(f / (fps / sps));            // 每格停留 fps/sps 帧；负帧号也向下取整
+}
+
+// motionBlur(drawFn, t, n, shutter, o)：把一帧拆成 n 个子帧分别画，再平均成一张（运动模糊）。
+//   用于快速旋转 / 快速移动的物体：每帧位移超过物体自身尺寸的一半时，不加模糊会看到「频闪 / 倒转 / 断成几个」。
+//   - drawFn(ctx, tt)：在给定 ctx 上画出第 tt 秒的画面。ctx 已重置为单位变换、全透明。
+//   - 子帧时间均匀分布在 [t, t + shutter/FPS) 内（取每段的中点）。shutter=0.5 相当于 180° 快门（电影常用）；1 = 360°。
+//   - n：子帧数。旋转越快需要越多（经验：每个子帧之间位移 ≤ 物体宽度的 1/4；8 够大多数情况，诡盘高速段用 12–16）。
+//   - 返回一张离屏画布（默认 W×H，可用 o.w / o.h 指定较小尺寸以提速），自己 drawImage 到主画布；给了 o.ctx 就直接画上去
+//     （画到 o.ctx 的 0,0，尺寸 o.dw×o.dh，默认 W×H）。drawFn 没画到的地方是透明的，不会盖住主画布原有内容。
+//   实现：每个子帧画在离屏画布上，再以 globalAlpha=1/n、'lighter'（相加）合成到累加画布：n 个子帧的预乘颜色相加 = 等权平均，
+//         不透明画面、透明叠层（只画物体、背景透明）都正确。
+//         实测（软件渲染 1920×1080，转盘）：n=8 约 40ms、n=16 约 90ms；对比 getImageData 浮点逐像素平均 190ms / 390ms，
+//         平均误差 0.02 级、最大 2–4 级（8 位量化），肉眼看不出。另一种「滚动平均」（source-over，第 k 个子帧权重 1/(k+1)）同样快，
+//         但量化误差会累积（最大 5–9 级），所以不用。物体只占画面一小块时用 o.w/o.h 开小画布、自己 drawImage 到位置上，能再快几倍。
+//   注意：drawFn 必须是确定性的（同一 tt 同一画面），且不能读主画布（子帧画在离屏上）。
+const _mbCache = {};
+function motionBlur(drawFn, t, n = 8, shutter = 0.5, o = {}) {
+  const w = o.w || W, h = o.h || H, key = w + 'x' + h;
+  if (!_mbCache[key]) _mbCache[key] = { acc: mk2d(w, h), sub: mk2d(w, h) };
+  const [accC, acc] = _mbCache[key].acc, [subC, sub] = _mbCache[key].sub;
+  acc.setTransform(1, 0, 0, 1, 0, 0); acc.globalAlpha = 1; acc.globalCompositeOperation = 'source-over'; acc.clearRect(0, 0, w, h);
+  n = Math.max(1, Math.round(n));
+  for (let k = 0; k < n; k++) {
+    const tt = t + shutter / FPS * (k + 0.5) / n;
+    sub.setTransform(1, 0, 0, 1, 0, 0); sub.globalAlpha = 1; sub.globalCompositeOperation = 'source-over'; sub.filter = 'none'; sub.clearRect(0, 0, w, h);
+    sub.save(); drawFn(sub, tt); sub.restore();
+    acc.globalCompositeOperation = 'lighter'; acc.globalAlpha = 1 / n;
+    acc.drawImage(subC, 0, 0);
+  }
+  acc.globalAlpha = 1; acc.globalCompositeOperation = 'source-over';
+  if (o.ctx) o.ctx.drawImage(accC, 0, 0, o.dw || W, o.dh || H);
+  return accC;
+}
+
+// ---- 相机 / 参数平滑（成片里文字之城上下抖：相机高度每帧按「脚下地形最高点」算，帧间跳变） ----
+// smoothTrack(fn, t0, t1, o)：把一条逐帧算会跳的参数曲线 fn(t)，预先采样、取滑动最大值、再多遍平滑，返回一个平滑的 t → 值 函数。
+//   o.dt      采样间隔（秒，默认 0.1）
+//   o.maxWin  滑动最大值的窗口总宽（秒，默认 0 = 不取最大值）。用于「离地间隙」「避开障碍」这类只能高不能低的量：
+//             先取窗口内最大值形成平台，再平滑，平滑后的曲线才（几乎）不会低于原值。经验：maxWin ≥ 2 × win × √passes；
+//             实测（带台阶的地形最高点）：maxWin=3, win=1, passes=4 时最多低 0.07；maxWin=1.2, win=.4 时最多低 2.7；不取最大值时低 40+。
+//             所以「离地间隙」类的量另外再加一点余量（文字之城用 +4）。
+//   o.win     平滑（滑动平均）的半窗口（秒，默认 1.0）
+//   o.passes  平滑遍数（默认 3；3–4 遍滑动平均 ≈ 高斯平滑，曲线二阶连续，镜头不会有「顿挫」）
+//   懒计算：第一次调用时才采样（fn 可以依赖 initFilm 里才准备好的数据，如高度图）。返回的函数有 .samples 方便画调试曲线。
+//   确定性：只依赖 fn 和参数，同一 t 永远同一值；分段渲染、跳帧截图都一致。
+// 例：相机离地高度（文字之城的修法）
+//   const camClear = smoothTrack(t => { const p = camPath(t); let g = 0;
+//       for (let i = -3; i <= 3; i++) for (let j = -2; j <= 8; j++) g = Math.max(g, terrainH(p.x + i * 3, p.z + j * 3));   // 机位前后左右一片的最高点
+//       return g + 4.0; }, 0, 82, { dt: 0.1, maxWin: 3, win: 1, passes: 4 });
+//   在 renderFrame 里：cam.y = Math.max(cam.y, camClear(lt));   // 不要再每帧直接用 terrainH 的最大值
+function smoothTrack(fn, t0, t1, o = {}) {
+  const dt = o.dt || 0.1, maxWin = o.maxWin || 0, win = o.win == null ? 1.0 : o.win, passes = o.passes == null ? 3 : o.passes;
+  let S = null;
+  const build = () => {
+    const N = Math.max(2, Math.ceil((t1 - t0) / dt) + 1); let a = new Float64Array(N);
+    for (let k = 0; k < N; k++) a[k] = fn(Math.min(t1, t0 + k * dt));
+    if (maxWin > 0) { const h = Math.max(1, Math.round(maxWin / 2 / dt)), b = new Float64Array(N); for (let k = 0; k < N; k++) { let m = -Infinity; for (let q = Math.max(0, k - h); q <= Math.min(N - 1, k + h); q++) m = Math.max(m, a[q]); b[k] = m; } a = b; }
+    const h = Math.round(win / dt);
+    for (let p = 0; p < passes && h > 0; p++) { const b = new Float64Array(N); for (let k = 0; k < N; k++) { let s = 0, n = 0; for (let q = Math.max(0, k - h); q <= Math.min(N - 1, k + h); q++) { s += a[q]; n++; } b[k] = s / n; } a = b; }
+    S = a; f.samples = a;
+  };
+  const f = t => { if (!S) build(); const x = clamp((t - t0) / dt, 0, S.length - 1), i = Math.floor(x), u = x - i; return lerp(S[i], S[Math.min(i + 1, S.length - 1)], u); };
+  return f;
+}
+
+// ---- 布局：按实际绘制范围居中（成片里鹈鹕没在画板正中：位置是全局常量，换了布局没跟着改） ----
+// measureDraw(drawFn, probe)：在离屏上画一次，扫出不透明像素的包围盒 {x0,y0,x1,y1,w,h,cx,cy}（drawFn 自己的坐标系）。
+//   drawFn(ctx) 以原点为参考画（离屏画布中心 = 原点，范围 ±probe/2，默认 ±1024）。一次约 30–60ms，结果按 key 缓存。
+// centerIn(ctx, drawFn, box, o)：把 drawFn 画的东西居中放进 box=[x,y,w,h]。
+//   o.fit = true：等比缩放到能放下（o.pad 留白比例，默认 0.08）；false（默认）：不缩放，只平移居中。
+//   o.key：缓存包围盒的键（形状不变就给一个，否则每次都量）。o.bbox：直接给包围盒（比如 pelican() 的返回值），不量。
+//   o.align：'center'（默认）或 'bottom'（底边贴住 box 底，适合站在地面上的角色）。
+//   返回实际用的 {s, dx, dy, bbox}。
+// 例：centerIn(ctx, c => pelican(c, 0, 0, 1, { ph }), [960, 140, 840, 700], { fit: true, key: 'pel' });
+const _bboxCache = {};
+function measureDraw(drawFn, probe = 2048, key) {
+  if (key && _bboxCache[key]) return _bboxCache[key];
+  const [c, x] = mk2d(probe, probe); x.translate(probe / 2, probe / 2); drawFn(x);
+  const d = x.getImageData(0, 0, probe, probe).data; let x0 = probe, y0 = probe, x1 = -1, y1 = -1;
+  for (let yy = 0; yy < probe; yy += 2) for (let xx = 0; xx < probe; xx += 2) if (d[(yy * probe + xx) * 4 + 3] > 8) { if (xx < x0) x0 = xx; if (xx > x1) x1 = xx; if (yy < y0) y0 = yy; if (yy > y1) y1 = yy; }
+  if (x1 < 0) return null;
+  if (x0 === 0 || y0 === 0 || x1 >= probe - 2 || y1 >= probe - 2) console.warn('measureDraw：图形碰到探测画布边缘，包围盒不完整，调大 probe');
+  const b = { x0: x0 - probe / 2, y0: y0 - probe / 2, x1: x1 + 2 - probe / 2, y1: y1 + 2 - probe / 2 }; b.w = b.x1 - b.x0; b.h = b.y1 - b.y0; b.cx = (b.x0 + b.x1) / 2; b.cy = (b.y0 + b.y1) / 2;
+  if (key) _bboxCache[key] = b; return b;
+}
+function centerIn(ctx, drawFn, box, o = {}) {
+  const b = o.bbox || measureDraw(drawFn, o.probe, o.key); if (!b) return null;
+  const [bx, by, bw, bh] = box, pad = o.pad == null ? 0.08 : o.pad;
+  const s = o.fit ? Math.min(bw * (1 - pad) / b.w, bh * (1 - pad) / b.h) : 1;
+  const tx = bx + bw / 2, ty = o.align === 'bottom' ? by + bh * (1 - pad / 2) - b.h * s / 2 : by + bh / 2;
+  ctx.save(); ctx.translate(tx, ty); ctx.scale(s, s); ctx.translate(-b.cx, -b.cy); drawFn(ctx); ctx.restore();
+  return { s, dx: tx - b.cx * s, dy: ty - b.cy * s, bbox: b };
+}
+
+// ---- 屏幕像素线宽（成片里小鸟翅膀「断了」：lineWidth .1 再整体 scale，成片尺寸下不到 1 像素） ----
+// screenScale(ctx)：当前变换的缩放（√|det|）。screenLW(ctx, px)：把线宽设成屏幕上 px 像素，不随 scale 变。
+// minLW(ctx, lw, px = 1.5)：线宽取 lw 和「屏幕 px 像素」中较大的一个。剪影的主体一律用填充，描边只做细节，并且至少 1.5px。
+function screenScale(ctx) { const m = ctx.getTransform(); return Math.sqrt(Math.abs(m.a * m.d - m.b * m.c)) || 1; }
+function screenLW(ctx, px) { ctx.lineWidth = px / screenScale(ctx); return ctx.lineWidth; }
+function minLW(ctx, lw, px = 1.5) { ctx.lineWidth = Math.max(lw, px / screenScale(ctx)); return ctx.lineWidth; }
