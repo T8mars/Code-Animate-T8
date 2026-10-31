@@ -1,0 +1,1 @@
+{ "name": "code-film", "private": true, "dependencies": { "playwright": "^1.48.0", "@fontsource/jetbrains-mono": "^5.0.0", "@fontsource/space-grotesk": "^5.0.0", "@fontsource/cormorant-garamond": "^5.0.0" } }
